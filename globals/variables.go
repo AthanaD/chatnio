@@ -3,12 +3,15 @@ package globals
 import (
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 )
 
 const ChatMaxThread = 5
 const AnonymousMaxThread = 1
+
+var HttpMaxTimeout = 30 * time.Minute
 
 var AllowedOrigins []string
 
@@ -20,6 +23,7 @@ var CacheAcceptedModels []string
 var CacheAcceptedExpire int64
 var CacheAcceptedSize int64
 var AcceptImageStore bool
+var AcceptPromptStore bool
 var CloseRegistration bool
 var CloseRelay bool
 
