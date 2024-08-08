@@ -10,6 +10,7 @@ import (
 	"chat/globals"
 	"chat/manager/conversation"
 	"chat/utils"
+	"time"
 
 	"database/sql"
 	"errors"
@@ -51,7 +52,9 @@ type partialChunk struct {
 func createStopSignal(conn *Connection) chan bool {
 	stopSignal := make(chan bool, 1)
 	go func(conn *Connection, stopSignal chan bool) {
+		ticker := time.NewTicker(100 * time.Millisecond)
 		defer func() {
+			ticker.Stop()
 			if r := recover(); r != nil && !strings.Contains(fmt.Sprintf("%s", r), "closed channel") {
 				stack := debug.Stack()
 				globals.Warn(fmt.Sprintf("caught panic from stop signal: %s\n%s", r, stack))
@@ -59,9 +62,14 @@ func createStopSignal(conn *Connection) chan bool {
 		}()
 
 		for {
-			if conn.PeekStop() != nil {
-				stopSignal <- true
-				break
+			select {
+			case <-ticker.C:
+				state := conn.PeekStop() != nil // check the stop state
+				stopSignal <- state
+
+				if state {
+					break
+				}
 			}
 		}
 	}(conn, stopSignal)
@@ -96,7 +104,7 @@ func createChatTask(
 		hit, err := channel.NewChatRequestWithCache(
 			cache, buffer,
 			auth.GetGroup(db, user),
-			&adaptercommon.ChatProps{
+			adaptercommon.CreateChatProps(&adaptercommon.ChatProps{
 				Model:             model,
 				Message:           segment,
 				MaxTokens:         instance.GetMaxTokens(),
@@ -106,7 +114,7 @@ func createChatTask(
 				PresencePenalty:   instance.GetPresencePenalty(),
 				FrequencyPenalty:  instance.GetFrequencyPenalty(),
 				RepetitionPenalty: instance.GetRepetitionPenalty(),
-			},
+			}, buffer),
 
 			// the function to handle the chunk data
 			func(data *globals.Chunk) error {
@@ -119,7 +127,7 @@ func createChatTask(
 				chunkChan <- partialChunk{
 					Chunk: data,
 					End:   false,
-					Hit:   true,
+					Hit:   false,
 					Error: nil,
 				}
 				return nil
@@ -150,35 +158,30 @@ func createChatTask(
 				return
 			}
 
-			sendPackError := conn.SendClient(globals.ChatSegmentResponse{
+			if err := conn.SendClient(globals.ChatSegmentResponse{
 				Message: buffer.WriteChunk(data.Chunk),
 				Quota:   buffer.GetQuota(),
 				End:     false,
 				Plan:    plan,
-			})
-			if sendPackError != nil {
-				globals.Warn(fmt.Sprintf("failed to send message to client: %s", sendPackError.Error()))
-				_ = conn.SendClient(globals.ChatSegmentResponse{
-					Message: sendPackError.Error(),
-					Quota:   buffer.GetQuota(),
-					End:     true,
-					Plan:    plan,
-				})
-
-				interruptSignal <- sendPackError
-
-				return hit, sendPackError
+			}); err != nil {
+				globals.Warn(fmt.Sprintf("failed to send message to client: %s", err.Error()))
+				interruptSignal <- err
+				return hit, nil
 			}
-		case <-stopSignal:
-			globals.Info(fmt.Sprintf("client stopped the chat request (model: %s, client: %s)", model, conn.GetCtx().ClientIP()))
-			_ = conn.SendClient(globals.ChatSegmentResponse{
-				Quota: buffer.GetQuota(),
-				End:   true,
-				Plan:  plan,
-			})
-			interruptSignal <- errors.New("signal")
 
-			return
+		case signal := <-stopSignal:
+			// if stop signal is received
+			if signal {
+				globals.Info(fmt.Sprintf("client stopped the chat request (model: %s, client: %s)", model, conn.GetCtx().ClientIP()))
+				_ = conn.SendClient(globals.ChatSegmentResponse{
+					Quota: buffer.GetQuota(),
+					End:   true,
+					Plan:  plan,
+				})
+				interruptSignal <- errors.New("signal")
+
+				return
+			}
 		}
 	}
 }
@@ -217,7 +220,7 @@ func ChatHandler(conn *Connection, user *auth.User, instance *conversation.Conve
 	buffer := utils.NewBuffer(model, segment, channel.ChargeInstance.GetCharge(model))
 	hit, err := createChatTask(conn, user, buffer, db, cache, model, instance, segment, plan)
 
-	admin.AnalysisRequest(model, buffer, err)
+	admin.AnalyseRequest(model, buffer, err)
 	if adapter.IsAvailableError(err) {
 		globals.Warn(fmt.Sprintf("%s (model: %s, client: %s)", err, model, conn.GetCtx().ClientIP()))
 
